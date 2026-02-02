@@ -1,86 +1,40 @@
-#include <cstdint>
-#include <cstdlib>
-#include <vector>
-#include <array>
-#include <string>
-#include <mutex>
 #include <jni.h>
-#include <android/input.h>
 #include <android/log.h>
-#include <android/native_window.h>
+#include <android/input.h>
 #include <EGL/egl.h>
+#include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
 #include <pthread.h>
-#include <signal.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <string.h>
+#include <vector>
+#include <algorithm>
+#include <array>
+#include <sys/mman.h>
+
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
+
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
 
-static std::mutex g_ImGuiMutex;
-static bool g_Initialized = false;
-static int g_Width = 0, g_Height = 0;
-
-static ANativeWindow* g_Window = nullptr;
-static ANativeWindow* (*orig_ANativeWindow_fromSurface)(JNIEnv* env, jobject surface) = nullptr;
-static EGLBoolean (*orig_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext) = nullptr;
-static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-static EGLSurface (*orig_eglCreateWindowSurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
-
-static bool g_PatchesReady = false;
-static std::vector<uintptr_t> g_PatchAddrs;
-static std::vector<std::array<uint8_t,4>> g_Originals;
-
-static void (*initMotionEvent)(void*, void*, void*) = nullptr;
-static void HookInput1(void* thiz, void* a1, void* a2) {
-    if (initMotionEvent) initMotionEvent(thiz, a1, a2);
-    if (thiz && g_Initialized) {
-        std::lock_guard<std::mutex> lock(g_ImGuiMutex);
-        ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+static void WriteMemory(void* dest, const void* src, size_t size, bool protect) {
+    if (protect) {
+        uintptr_t page_size = sysconf(_SC_PAGESIZE);
+        uintptr_t addr = (uintptr_t)dest;
+        uintptr_t page_addr = addr & ~(page_size - 1);
+        mprotect((void*)page_addr, page_size, PROT_READ | PROT_WRITE | PROT_EXEC);
     }
-}
-
-static int32_t (*Consume)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
-static int32_t HookInput2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
-    int32_t result = Consume ? Consume(thiz, a1, a2, a3, a4, event) : 0;
-    if (result == 0 && event && *event && g_Initialized) {
-        std::lock_guard<std::mutex> lock(g_ImGuiMutex);
-        ImGui_ImplAndroid_HandleInputEvent(*event);
+    memcpy(dest, src, size);
+    if (protect) {
+        uintptr_t page_size = sysconf(_SC_PAGESIZE);
+        uintptr_t addr = (uintptr_t)dest;
+        uintptr_t page_addr = addr & ~(page_size - 1);
+        mprotect((void*)page_addr, page_size, PROT_READ | PROT_EXEC);
     }
-    return result;
-}
-
-struct GLState {
-    GLint program;
-    GLint vao;
-    GLint fbo;
-    GLint viewport[4];
-    GLint scissor[4];
-    GLboolean blend;
-    GLboolean scissorTest;
-};
-
-static void SaveGL(GLState& s) {
-    glGetIntegerv(GL_CURRENT_PROGRAM, &s.program);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
-    glGetIntegerv(GL_VIEWPORT, s.viewport);
-    glGetIntegerv(GL_SCISSOR_BOX, s.scissor);
-    s.blend = glIsEnabled(GL_BLEND);
-    s.scissorTest = glIsEnabled(GL_SCISSOR_TEST);
-}
-
-static void RestoreGL(const GLState& s) {
-    glUseProgram(s.program);
-    glBindVertexArray(s.vao);
-    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
-    glViewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
-    glScissor(s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]);
-    s.blend ? glEnable(GL_BLEND) : glDisable(GL_BLEND);
-    s.scissorTest ? glEnable(GL_SCISSOR_TEST) : glDisable(GL_SCISSOR_TEST);
+    __builtin___clear_cache((char*)dest, (char*)dest + size);
 }
 
 static uint32_t EncodeCmpW8Imm_Table(int imm) {
@@ -95,8 +49,67 @@ static uint32_t EncodeCmpW8Imm_Table(int imm) {
     return instr;
 }
 
+static bool g_PatchesReady = false;
+static std::vector<uintptr_t> g_PatchAddrs;
+static std::vector<std::array<uint8_t,4>> g_Originals;
+
+static void ScanSignatures() {
+    if (g_PatchesReady) return;
+    uintptr_t base = GlossGetLibSection("libminecraftpe.so", ".text", nullptr);
+    size_t size = 0;
+    GlossGetLibSection("libminecraftpe.so", ".text", &size);
+
+    if (base == 0 || size == 0) return;
+
+    const std::vector<std::vector<uint8_t>> signatures = {
+        {0xE3,0x03,0x19,0x2A,0xE4,0x03,0x14,0xAA,0xA5,0x00,0x80,0x52,0x08,0x05,0x00,0x51},
+        {0xE3,0x03,0x19,0x2A,0x29,0x05,0x00,0x51,0xE4,0x03,0x14,0xAA,0x65,0x00,0x80,0x52},
+        {0xE3,0x03,0x19,0x2A,0xE4,0x03,0x14,0xAA,0x85,0x00,0x80,0x52,0x08,0x05,0x00,0x11},
+        {0xE3,0x03,0x19,0x2A,0x29,0x05,0x00,0x11,0xE4,0x03,0x14,0xAA,0x45,0x00,0x80,0x52},
+        {0x62,0x02,0x00,0x54,0xFB,0x13,0x40,0xF9,0x7F,0x17,0x00,0xF1},
+        {0x5F,0x51,0x05,0xF1,0x8B,0x2D,0x0D,0x9B},
+        {0x1F,0x15,0x00,0x71,0xA1,0x01,0x00,0x54,0x00,0xE4,0x00,0x6F},
+        {0x1F,0x15,0x00,0x71,0x01,0xF8,0xFF,0x54,0x88,0x02,0x40,0xF9},
+    };
+
+    for (auto& sig : signatures) {
+        for (size_t i = 0; i + sig.size() < size; i++) {
+            if (!memcmp((void*)(base + i), sig.data(), sig.size())) {
+                uintptr_t addr = base + i;
+                g_PatchAddrs.push_back(addr);
+                std::array<uint8_t,4> orig;
+                memcpy(orig.data(), (void*)addr, 4);
+                g_Originals.push_back(orig);
+            }
+        }
+    }
+    g_PatchesReady = true;
+}
+
+static bool g_initialized = false;
+static int g_width = 0, g_height = 0;
+static EGLContext g_targetcontext = EGL_NO_CONTEXT;
+static EGLSurface g_targetsurface = EGL_NO_SURFACE;
+static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
+static void (*orig_input1)(void*, void*, void*) = nullptr;
+static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+
+static void hook_input1(void* thiz, void* a1, void* a2) {
+    if (orig_input1) orig_input1(thiz, a1, a2);
+    if (thiz && g_initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
+}
+
+static int32_t hook_input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
+    int32_t result = orig_input2 ? orig_input2(thiz, a1, a2, a3, a4, event) : 0;
+    if (result == 0 && event && *event && g_initialized) ImGui_ImplAndroid_HandleInputEvent(*event);
+    return result;
+}
+
 static void DrawMenu() {
-    ImGui::Begin("AnarchyArray", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize);
+    ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(350, 250), ImGuiCond_FirstUseEver);
+    ImGui::Begin("AnarchyArray", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+
     static bool infinitySpread = false;
     static bool spongePlus = false;
     static bool spongePlusPlus = false;
@@ -215,177 +228,100 @@ static void DrawMenu() {
     ImGui::End();
 }
 
-static void ScanSignatures() {
-    uintptr_t base = GlossGetLibSection("libminecraftpe.so", ".text", nullptr);
-    size_t size = 0;
-    GlossGetLibSection("libminecraftpe.so", ".text", &size);
-
-    if (base == 0 || size == 0) return;
-
-    const std::vector<std::vector<uint8_t>> signatures = {
-        {0xE3,0x03,0x19,0x2A,0xE4,0x03,0x14,0xAA,0xA5,0x00,0x80,0x52,0x08,0x05,0x00,0x51},
-        {0xE3,0x03,0x19,0x2A,0x29,0x05,0x00,0x51,0xE4,0x03,0x14,0xAA,0x65,0x00,0x80,0x52},
-        {0xE3,0x03,0x19,0x2A,0xE4,0x03,0x14,0xAA,0x85,0x00,0x80,0x52,0x08,0x05,0x00,0x11},
-        {0xE3,0x03,0x19,0x2A,0x29,0x05,0x00,0x11,0xE4,0x03,0x14,0xAA,0x45,0x00,0x80,0x52},
-        {0x62,0x02,0x00,0x54,0xFB,0x13,0x40,0xF9,0x7F,0x17,0x00,0xF1},
-        {0x5F,0x51,0x05,0xF1,0x8B,0x2D,0x0D,0x9B},
-        {0x1F,0x15,0x00,0x71,0xA1,0x01,0x00,0x54,0x00,0xE4,0x00,0x6F},
-        {0x1F,0x15,0x00,0x71,0x01,0xF8,0xFF,0x54,0x88,0x02,0x40,0xF9},
-    };
-
-    for (auto& sig : signatures) {
-        for (size_t i = 0; i + sig.size() < size; i++) {
-            if (!memcmp((void*)(base + i), sig.data(), sig.size())) {
-                uintptr_t addr = base + i;
-                g_PatchAddrs.push_back(addr);
-                std::array<uint8_t,4> orig;
-                memcpy(orig.data(), (void*)addr, 4);
-                g_Originals.push_back(orig);
-            }
-        }
-    }
-    g_PatchesReady = true;
-}
-
-static void Setup(ANativeWindow* window) {
-    if (!window) return;
+static void setup() {
+    if (g_initialized || g_width <= 0) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.ConfigFlags |= ImGuiConfigFlags_IsTouchScreen;
-
-    float scale = (float)g_Height / 720.0f;
-    if (scale < 1.5f) scale = 1.5f;
-    if (scale > 4.0f) scale = 4.0f;
-
-    ImFontConfig cfg;
-    cfg.SizePixels = 18.0f * scale;
-    io.Fonts->AddFontDefault(&cfg);
-
-    ImGui_ImplAndroid_Init(window);
+    io.FontGlobalScale = 1.4f;
+    ImGui_ImplAndroid_Init();
     ImGui_ImplOpenGL3_Init("#version 300 es");
-    
-    ImGuiStyle& style = ImGui::GetStyle();
-    style.ScaleAllSizes(scale * 0.65f);
-    style.Alpha = 1.0f;
-    g_Initialized = true;
+    g_initialized = true;
 }
 
-static void Render() {
-    if (!g_Initialized) return;
-    
+static void render() {
+    if (!g_initialized) return;
+
     if (!g_PatchesReady) {
         ScanSignatures();
     }
 
-    std::lock_guard<std::mutex> lock(g_ImGuiMutex);
-    
-    static int lastW = 0, lastH = 0;
-    ImGuiIO& io = ImGui::GetIO();
-    if (g_Width != lastW || g_Height != lastH) {
-        io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
-        lastW = g_Width;
-        lastH = g_Height;
-    }
+    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
+    GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
+    GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
+    GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
+    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
+    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
+    GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
+    GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean last_blend = glIsEnabled(GL_BLEND);
 
-    GLState gl;
-    SaveGL(gl);
-    
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2((float)g_width, (float)g_height);
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame();
+    ImGui_ImplAndroid_NewFrame(g_width, g_height);
     ImGui::NewFrame();
     
     DrawMenu();
     
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    
-    RestoreGL(gl);
+
+    glUseProgram(last_prog);
+    glBindTexture(GL_TEXTURE_2D, last_tex);
+    glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
+    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
 }
 
-static EGLSurface hook_eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint* attrib_list) {
-    EGLSurface surf = orig_eglCreateWindowSurface(dpy, config, win, attrib_list);
-    if (!g_Initialized && win) {
-        Setup((ANativeWindow*)win);
-    }
-    return surf;
-}
-
-static ANativeWindow* hook_ANativeWindow_fromSurface(JNIEnv* env, jobject surface) {
-    ANativeWindow* win = orig_ANativeWindow_fromSurface(env, surface);
-    g_Window = win;
-    return win;
-}
-
-static EGLBoolean hook_eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read, EGLContext ctx) {
-    EGLBoolean result = orig_eglMakeCurrent(dpy, draw, read, ctx);
-    if (!g_Initialized && g_Window && draw != EGL_NO_SURFACE) {
-        EGLint w=0,h=0;
-        eglQuerySurface(dpy, draw, EGL_WIDTH, &w);
-        eglQuerySurface(dpy, draw, EGL_HEIGHT, &h);
-        g_Width = w;
-        g_Height = h;
-        Setup(g_Window);
-    }
-    return result;
-}
-
-static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
-    if (!orig_eglSwapBuffers) return EGL_FALSE;
+static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
+    if (!orig_eglswapbuffers) return EGL_FALSE;
     EGLContext ctx = eglGetCurrentContext();
-    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(dpy, surf);
+    if (ctx == EGL_NO_CONTEXT || (g_targetcontext != EGL_NO_CONTEXT && (ctx != g_targetcontext || surf != g_targetsurface)))
+        return orig_eglswapbuffers(dpy, surf);
     
-    EGLint w = 0, h = 0;
+    EGLint w, h;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
-    g_Width = w;
-    g_Height = h;
+    if (w < 100 || h < 100) return orig_eglswapbuffers(dpy, surf);
+
+    if (g_targetcontext == EGL_NO_CONTEXT) { g_targetcontext = ctx; g_targetsurface = surf; }
+    g_width = w; g_height = h;
     
-    if (g_Initialized) Render();
+    setup();
+    render();
     
-    return orig_eglSwapBuffers(dpy, surf);
+    return orig_eglswapbuffers(dpy, surf);
 }
 
-static void HookInput() {
-    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (sym1) {
-        GlossHook(sym1, (void*)HookInput1, (void**)&initMotionEvent);
-    }
-
-    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
-        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym2) {
-        GlossHook(sym2, (void*)HookInput2, (void**)&Consume);
-    }
+static void hookinput() {
+    void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
+    if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
+    
+    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
+    if (sym2) GlossHook(sym2, (void*)hook_input1, (void**)&orig_input1);
 }
 
-static void* MainThread(void*) {
+static void* mainthread(void*) {
+    sleep(3);
     GlossInit(true);
-    GHandle hEGL = GlossOpen("libEGL.so");
-    if (hEGL) {
-        void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
-        if (swap) GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
-        
-        void* create = (void*)GlossSymbol(hEGL, "eglCreateWindowSurface", nullptr);
-        if (create) GlossHook(create, (void*)hook_eglCreateWindowSurface, (void**)&orig_eglCreateWindowSurface);
-        
-        void* makeCurrent = (void*)GlossSymbol(hEGL, "eglMakeCurrent", nullptr);
-        if (makeCurrent) GlossHook(makeCurrent, (void*)hook_eglMakeCurrent, (void**)&orig_eglMakeCurrent);
+    GHandle hegl = GlossOpen("libEGL.so");
+
+    if (hegl) {
+        void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
+        if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
     }
 
-    GHandle hAndroid = GlossOpen("libandroid.so");
-    if (hAndroid) {
-        void* f = (void*)GlossSymbol(hAndroid, "ANativeWindow_fromSurface", nullptr);
-        if (f) GlossHook(f, (void*)hook_ANativeWindow_fromSurface, (void**)&orig_ANativeWindow_fromSurface);
-    }
-
-    HookInput();
+    hookinput();
     return nullptr;
 }
 
 __attribute__((constructor))
-void AnarchyArray_Init() {
+void display_init() {
     pthread_t t;
-    pthread_create(&t, nullptr, MainThread, nullptr);
+    pthread_create(&t, nullptr, mainthread, nullptr);
 }
