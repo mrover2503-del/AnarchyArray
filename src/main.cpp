@@ -4,23 +4,18 @@
 #include <array>
 #include <string>
 #include <mutex>
-
 #include <jni.h>
 #include <android/input.h>
 #include <android/log.h>
 #include <android/native_window.h>
-
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
-
 #include <pthread.h>
 #include <signal.h>
 #include <unistd.h>
 #include <dlfcn.h>
-
 #include "pl/Hook.h"
 #include "pl/Gloss.h"
-
 #include "ImGui/imgui.h"
 #include "ImGui/backends/imgui_impl_opengl3.h"
 #include "ImGui/backends/imgui_impl_android.h"
@@ -225,6 +220,8 @@ static void ScanSignatures() {
     size_t size = 0;
     GlossGetLibSection("libminecraftpe.so", ".text", &size);
 
+    if (base == 0 || size == 0) return;
+
     const std::vector<std::vector<uint8_t>> signatures = {
         {0xE3,0x03,0x19,0x2A,0xE4,0x03,0x14,0xAA,0xA5,0x00,0x80,0x52,0x08,0x05,0x00,0x51},
         {0xE3,0x03,0x19,0x2A,0x29,0x05,0x00,0x51,0xE4,0x03,0x14,0xAA,0x65,0x00,0x80,0x52},
@@ -277,6 +274,10 @@ static void Setup(ANativeWindow* window) {
 static void Render() {
     if (!g_Initialized) return;
     
+    if (!g_PatchesReady) {
+        ScanSignatures();
+    }
+
     std::lock_guard<std::mutex> lock(g_ImGuiMutex);
     
     static int lastW = 0, lastH = 0;
@@ -380,7 +381,6 @@ static void* MainThread(void*) {
     }
 
     HookInput();
-    ScanSignatures();
     return nullptr;
 }
 
