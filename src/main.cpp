@@ -1,6 +1,5 @@
 #include <jni.h>
 #include <android/input.h>
-#include <android/log.h>
 #include <android/native_window.h>
 #include <EGL/egl.h>
 #include <GLES3/gl3.h>
@@ -22,15 +21,15 @@
 static bool g_Initialized = false;
 static int g_Width = 0, g_Height = 0;
 static ANativeWindow* g_Window = nullptr;
+static EGLContext g_TargetContext = EGL_NO_CONTEXT;
+static EGLSurface g_TargetSurface = EGL_NO_SURFACE;
 
 static bool g_PatchesReady = false;
 static std::vector<uintptr_t> g_PatchAddrs;
 static std::vector<std::array<uint8_t, 4>> g_Originals;
 
-static ANativeWindow* (*orig_ANativeWindow_fromSurface)(JNIEnv*, jobject) = nullptr;
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
-static void (*orig_Input1)(void*, void*, void*) = nullptr;
-static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
+static ANativeWindow* (*orig_ANativeWindow_fromSurface)(JNIEnv*, jobject) = nullptr;
 
 static void WriteMemory(void* dest, const void* src, size_t size, bool protect) {
     if (protect) {
@@ -75,11 +74,13 @@ static void ScanSignatures() {
     g_PatchesReady = true;
 }
 
+static void (*orig_Input1)(void*, void*, void*) = nullptr;
 static void hook_Input1(void* thiz, void* a1, void* a2) {
     if (orig_Input1) orig_Input1(thiz, a1, a2);
     if (thiz && g_Initialized) ImGui_ImplAndroid_HandleInputEvent((AInputEvent*)thiz);
 }
 
+static int32_t (*orig_Input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 static int32_t hook_Input2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, AInputEvent** event) {
     int32_t result = orig_Input2 ? orig_Input2(thiz, a1, a2, a3, a4, event) : 0;
     if (result == 0 && event && *event && g_Initialized) {
@@ -139,7 +140,11 @@ static void DrawMenu() {
     static bool spongePlus = false;
     static bool spongePlusPlus = false;
 
-    ImGui::Begin("AnarchyArray", nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize);
+    ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowSize(ImVec2(300, 0), ImGuiCond_FirstUseEver);
+    ImGui::Begin("FPS & Sponge", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::Text("%.1f FPS", io.Framerate);
+    ImGui::Separator();
 
     if (ImGui::Checkbox("InfinitySpread", &infinitySpread) && g_PatchesReady) {
         const uint8_t patch[] = {0x03, 0x00, 0x80, 0x52};
@@ -152,11 +157,7 @@ static void DrawMenu() {
         const uint8_t patchPlus[] = {0x1F, 0x20, 0x03, 0xD5, 0xFB, 0x13, 0x40, 0xF9, 0x7F, 0x07, 0x00, 0xB1};
         size_t idx = 4;
         if (idx < g_PatchAddrs.size()) {
-            if (spongePlus) {
-                WriteMemory((void*)g_PatchAddrs[idx], (void*)patchPlus, sizeof(patchPlus), true);
-            } else {
-                WriteMemory((void*)g_PatchAddrs[idx], (void*)g_Originals[idx].data(), 4, true);
-            }
+            WriteMemory((void*)g_PatchAddrs[idx], spongePlus ? (void*)patchPlus : (void*)g_Originals[idx].data(), spongePlus ? sizeof(patchPlus) : 4, true);
         }
     }
 
@@ -165,21 +166,16 @@ static void DrawMenu() {
         const uint8_t patchPlusPlus[] = {0x5F, 0xFD, 0x03, 0xF1, 0x8B, 0x2D, 0x0D, 0x9B};
         size_t idx = 5;
         if (idx < g_PatchAddrs.size()) {
-            if (spongePlusPlus) {
-                WriteMemory((void*)g_PatchAddrs[idx], (void*)patchPlusPlus, sizeof(patchPlusPlus), true);
-            } else {
-                WriteMemory((void*)g_PatchAddrs[idx], (void*)g_Originals[idx].data(), 4, true);
-            }
+            WriteMemory((void*)g_PatchAddrs[idx], spongePlusPlus ? (void*)patchPlusPlus : (void*)g_Originals[idx].data(), spongePlusPlus ? sizeof(patchPlusPlus) : 4, true);
         }
     }
     ImGui::EndDisabled();
 
-    ImGui::Text("%.1f FPS", ImGui::GetIO().Framerate);
     ImGui::End();
 }
 
 static void Setup() {
-    if (g_Initialized || !g_Window) return;
+    if (g_Initialized || g_Width <= 0 || g_Height <= 0 || !g_Window) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -187,7 +183,7 @@ static void Setup() {
     if (scale < 1.5f) scale = 1.5f;
     if (scale > 4.0f) scale = 4.0f;
     ImFontConfig cfg;
-    cfg.SizePixels = 24.0f * scale;
+    cfg.SizePixels = 32.0f * scale;
     io.Fonts->AddFontDefault(&cfg);
     ImGui_ImplAndroid_Init(g_Window);
     ImGui_ImplOpenGL3_Init("#version 300 es");
@@ -212,21 +208,42 @@ static void Render() {
 
 static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglSwapBuffers) return EGL_FALSE;
+    EGLContext ctx = eglGetCurrentContext();
+    if (ctx == EGL_NO_CONTEXT) return orig_eglSwapBuffers(dpy, surf);
     EGLint w = 0, h = 0;
     eglQuerySurface(dpy, surf, EGL_WIDTH, &w);
     eglQuerySurface(dpy, surf, EGL_HEIGHT, &h);
+    if (w < 500 || h < 500) return orig_eglSwapBuffers(dpy, surf);
+    if (g_TargetContext == EGL_NO_CONTEXT) {
+        EGLint buf = 0;
+        eglQuerySurface(dpy, surf, EGL_RENDER_BUFFER, &buf);
+        if (buf == EGL_BACK_BUFFER) {
+            g_TargetContext = ctx;
+            g_TargetSurface = surf;
+        }
+    }
+    if (ctx != g_TargetContext || surf != g_TargetSurface)
+        return orig_eglSwapBuffers(dpy, surf);
     g_Width = w;
     g_Height = h;
-    if (!g_Initialized && g_Window) Setup();
-    if (g_Initialized) Render();
+    Setup();
+    Render();
     return orig_eglSwapBuffers(dpy, surf);
 }
 
 static void HookInput() {
-    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
-    if (sym1) GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
-    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
-    if (sym2) GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
+    void* sym1 = (void*)GlossSymbol(GlossOpen("libinput.so"),
+        "_ZN7android13InputConsumer21initializeMotionEventEPNS_11MotionEventEPKNS_12InputMessageE", nullptr);
+    if (sym1) {
+        GHook h = GlossHook(sym1, (void*)hook_Input1, (void**)&orig_Input1);
+        if (h) return;
+    }
+    void* sym2 = (void*)GlossSymbol(GlossOpen("libinput.so"),
+        "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
+    if (sym2) {
+        GHook h = GlossHook(sym2, (void*)hook_Input2, (void**)&orig_Input2);
+        if (h) return;
+    }
 }
 
 static void* MainThread(void*) {
@@ -234,6 +251,7 @@ static void* MainThread(void*) {
     GlossInit(true);
     GHandle hEGL = GlossOpen("libEGL.so");
     GHandle hAndroid = GlossOpen("libandroid.so");
+
     if (hEGL) {
         void* swap = (void*)GlossSymbol(hEGL, "eglSwapBuffers", nullptr);
         if (swap) GlossHook(swap, (void*)hook_eglSwapBuffers, (void**)&orig_eglSwapBuffers);
@@ -242,13 +260,14 @@ static void* MainThread(void*) {
         void* win = (void*)GlossSymbol(hAndroid, "ANativeWindow_fromSurface", nullptr);
         if (win) GlossHook(win, (void*)hook_ANativeWindow_fromSurface, (void**)&orig_ANativeWindow_fromSurface);
     }
+
     HookInput();
     ScanSignatures();
     return nullptr;
 }
 
 __attribute__((constructor))
-void AnarchyArray_Init() {
+void DisplayFPS_Init() {
     pthread_t t;
     pthread_create(&t, nullptr, MainThread, nullptr);
 }
