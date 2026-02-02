@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <android/log.h>
 #include <android/input.h>
+#include <android/native_window.h>
 #include <EGL/egl.h>
 #include <GLES2/gl2.h>
 #include <GLES3/gl3.h>
@@ -88,9 +89,11 @@ static void ScanSignatures() {
 
 static bool g_initialized = false;
 static int g_width = 0, g_height = 0;
+static ANativeWindow* g_window = nullptr;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
+static EGLSurface (*orig_eglcreatewindowsurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
 static void (*orig_input1)(void*, void*, void*) = nullptr;
 static int32_t (*orig_input2)(void*, void*, bool, long, uint32_t*, AInputEvent**) = nullptr;
 
@@ -229,12 +232,12 @@ static void DrawMenu() {
 }
 
 static void setup() {
-    if (g_initialized || g_width <= 0) return;
+    if (g_initialized || g_width <= 0 || !g_window) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.FontGlobalScale = 1.4f;
-    ImGui_ImplAndroid_Init();
+    ImGui_ImplAndroid_Init(g_window);
     ImGui_ImplOpenGL3_Init("#version 300 es");
     g_initialized = true;
 }
@@ -259,7 +262,7 @@ static void render() {
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)g_width, (float)g_height);
     ImGui_ImplOpenGL3_NewFrame();
-    ImGui_ImplAndroid_NewFrame(g_width, g_height);
+    ImGui_ImplAndroid_NewFrame();
     ImGui::NewFrame();
     
     DrawMenu();
@@ -298,6 +301,11 @@ static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
     return orig_eglswapbuffers(dpy, surf);
 }
 
+static EGLSurface hook_eglcreatewindowsurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint* attrib_list) {
+    if (win) g_window = (ANativeWindow*)win;
+    return orig_eglcreatewindowsurface ? orig_eglcreatewindowsurface(dpy, config, win, attrib_list) : EGL_NO_SURFACE;
+}
+
 static void hookinput() {
     void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
     if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
@@ -314,6 +322,9 @@ static void* mainthread(void*) {
     if (hegl) {
         void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
         if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
+
+        void* create = (void*)GlossSymbol(hegl, "eglCreateWindowSurface", nullptr);
+        if (create) GlossHook(create, (void*)hook_eglcreatewindowsurface, (void**)&orig_eglcreatewindowsurface);
     }
 
     hookinput();
