@@ -92,6 +92,8 @@ static int g_width = 0, g_height = 0;
 static ANativeWindow* g_window = nullptr;
 static EGLContext g_targetcontext = EGL_NO_CONTEXT;
 static EGLSurface g_targetsurface = EGL_NO_SURFACE;
+
+static ANativeWindow* (*orig_ANativeWindow_fromSurface)(JNIEnv*, jobject) = nullptr;
 static EGLBoolean (*orig_eglswapbuffers)(EGLDisplay, EGLSurface) = nullptr;
 static EGLSurface (*orig_eglcreatewindowsurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
 static void (*orig_input1)(void*, void*, void*) = nullptr;
@@ -258,6 +260,11 @@ static void render() {
     GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
     GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
     GLboolean last_blend = glIsEnabled(GL_BLEND);
+    GLboolean last_cull = glIsEnabled(GL_CULL_FACE);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_SCISSOR_TEST);
 
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2((float)g_width, (float)g_height);
@@ -279,6 +286,7 @@ static void render() {
     if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (last_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
 }
 
 static EGLBoolean hook_eglswapbuffers(EGLDisplay dpy, EGLSurface surf) {
@@ -306,6 +314,12 @@ static EGLSurface hook_eglcreatewindowsurface(EGLDisplay dpy, EGLConfig config, 
     return orig_eglcreatewindowsurface ? orig_eglcreatewindowsurface(dpy, config, win, attrib_list) : EGL_NO_SURFACE;
 }
 
+static ANativeWindow* hook_ANativeWindow_fromSurface(JNIEnv* env, jobject surface) {
+    ANativeWindow* win = orig_ANativeWindow_fromSurface(env, surface);
+    if (win) g_window = win;
+    return win;
+}
+
 static void hookinput() {
     void* sym = (void*)GlossSymbol(GlossOpen("libinput.so"), "_ZN7android13InputConsumer7consumeEPNS_26InputEventFactoryInterfaceEblPjPPNS_10InputEventE", nullptr);
     if (sym) GlossHook(sym, (void*)hook_input2, (void**)&orig_input2);
@@ -318,13 +332,18 @@ static void* mainthread(void*) {
     sleep(3);
     GlossInit(true);
     GHandle hegl = GlossOpen("libEGL.so");
-
     if (hegl) {
         void* swap = (void*)GlossSymbol(hegl, "eglSwapBuffers", nullptr);
         if (swap) GlossHook(swap, (void*)hook_eglswapbuffers, (void**)&orig_eglswapbuffers);
 
         void* create = (void*)GlossSymbol(hegl, "eglCreateWindowSurface", nullptr);
         if (create) GlossHook(create, (void*)hook_eglcreatewindowsurface, (void**)&orig_eglcreatewindowsurface);
+    }
+    
+    GHandle handroid = GlossOpen("libandroid.so");
+    if (handroid) {
+        void* fromSurf = (void*)GlossSymbol(handroid, "ANativeWindow_fromSurface", nullptr);
+        if (fromSurf) GlossHook(fromSurf, (void*)hook_ANativeWindow_fromSurface, (void**)&orig_ANativeWindow_fromSurface);
     }
 
     hookinput();
