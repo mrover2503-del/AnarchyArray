@@ -3,7 +3,6 @@
 #include <vector>
 #include <array>
 #include <string>
-#include <mutex>
 
 #include <jni.h>
 #include <android/input.h>
@@ -40,7 +39,6 @@ static EGLBoolean (*orig_eglMakeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGL
 static EGLBoolean (*orig_eglSwapBuffers)(EGLDisplay, EGLSurface) = nullptr;
 static EGLSurface (*orig_eglCreateWindowSurface)(EGLDisplay, EGLConfig, EGLNativeWindowType, const EGLint*) = nullptr;
 
-// 마인크래프트 패치 관련
 static bool g_PatchesReady = false;
 static std::vector<uintptr_t> g_PatchAddrs;
 static std::vector<std::array<uint8_t,4>> g_Originals;
@@ -191,7 +189,46 @@ void apply_motion_blur(int width, int height) {
 }
 
 // ==========================================
-// [3] 입력 훅 (libinput.so)
+// [3] 강력한 OpenGL 상태 백업/복구 체계
+// ==========================================
+struct GLState {
+    GLint program, vao, fbo, array_buffer, element_array_buffer, unpack_buffer;
+    GLint viewport[4], scissor[4];
+    GLboolean blend, scissorTest, depthTest, cullFace;
+};
+
+static void SaveGL(GLState& s) {
+    glGetIntegerv(GL_CURRENT_PROGRAM, &s.program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &s.fbo);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &s.array_buffer);
+    glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &s.element_array_buffer);
+    glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &s.unpack_buffer);
+    glGetIntegerv(GL_VIEWPORT, s.viewport);
+    glGetIntegerv(GL_SCISSOR_BOX, s.scissor);
+    s.blend = glIsEnabled(GL_BLEND);
+    s.scissorTest = glIsEnabled(GL_SCISSOR_TEST);
+    s.depthTest = glIsEnabled(GL_DEPTH_TEST);
+    s.cullFace = glIsEnabled(GL_CULL_FACE);
+}
+
+static void RestoreGL(const GLState& s) {
+    glUseProgram(s.program);
+    glBindVertexArray(s.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, s.array_buffer);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, s.element_array_buffer);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, s.unpack_buffer);
+    glBindFramebuffer(GL_FRAMEBUFFER, s.fbo);
+    glViewport(s.viewport[0], s.viewport[1], s.viewport[2], s.viewport[3]);
+    glScissor(s.scissor[0], s.scissor[1], s.scissor[2], s.scissor[3]);
+    if (s.blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (s.scissorTest) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (s.depthTest) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (s.cullFace) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+}
+
+// ==========================================
+// [4] 입력 훅 (libinput.so)
 // ==========================================
 static void (*initMotionEvent)(void*, void*, void*) = nullptr;
 static void HookInput1(void* thiz, void* a1, void* a2) {
@@ -207,7 +244,7 @@ static int32_t HookInput2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, 
 }
 
 // ==========================================
-// [4] 마인크래프트 메모리 패치 로직
+// [5] 마인크래프트 메모리 패치 로직
 // ==========================================
 static uint32_t EncodeCmpW8Imm_Table(int imm) {
     if (imm < 0 || imm > 575) return 0;
@@ -251,13 +288,12 @@ static void ScanSignatures() {
 }
 
 // ==========================================
-// [5] 통합 메뉴 UI
+// [6] 통합 메뉴 UI
 // ==========================================
 static void DrawMenu() {
     ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
     ImGui::Begin("AnarchyArray Menu", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
 
-    // 1. Minecraft Patches 섹션
     if (ImGui::CollapsingHeader("Minecraft Patches", ImGuiTreeNodeFlags_DefaultOpen)) {
         static bool infinitySpread = false;
         static bool spongePlus = false;
@@ -328,7 +364,6 @@ static void DrawMenu() {
         }
     }
 
-    // 2. Motion Blur 섹션
     if (ImGui::CollapsingHeader("Visual Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Checkbox("Enable Motion Blur", &motion_blur_enabled);
         if (motion_blur_enabled) {
@@ -341,10 +376,10 @@ static void DrawMenu() {
 }
 
 // ==========================================
-// [6] ImGui 초기화 및 메인 렌더링 루프
+// [7] ImGui 초기화 및 메인 렌더링 루프
 // ==========================================
-static void Setup() {
-    if (g_Initialized || !g_Window) return;
+static void Setup(ANativeWindow* window) {
+    if (g_Initialized || !window) return;
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -356,7 +391,7 @@ static void Setup() {
     ImFontConfig cfg; cfg.SizePixels = 18.0f * scale;
     io.Fonts->AddFontDefault(&cfg);
     
-    ImGui_ImplAndroid_Init(g_Window);
+    ImGui_ImplAndroid_Init(window);
     ImGui_ImplOpenGL3_Init("#version 300 es");
     ImGui::GetStyle().ScaleAllSizes(scale * 0.65f);
     
@@ -367,32 +402,26 @@ static void Setup() {
 static void Render() {
     if (!g_Initialized) return;
 
-    // OpenGL 상태 철저히 저장
-    GLint last_prog; glGetIntegerv(GL_CURRENT_PROGRAM, &last_prog);
-    GLint last_tex; glGetIntegerv(GL_TEXTURE_BINDING_2D, &last_tex);
-    GLint last_active_tex; glGetIntegerv(GL_ACTIVE_TEXTURE, &last_active_tex);
-    GLint last_array_buffer; glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &last_array_buffer);
-    GLint last_element_array_buffer; glGetIntegerv(GL_ELEMENT_ARRAY_BUFFER_BINDING, &last_element_array_buffer);
-    GLint last_vao; glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &last_vao);
-    GLint last_fbo; glGetIntegerv(GL_FRAMEBUFFER_BINDING, &last_fbo);
-    GLint last_viewport[4]; glGetIntegerv(GL_VIEWPORT, last_viewport);
-    GLint last_unpack; glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &last_unpack);
-    
-    GLboolean last_scissor = glIsEnabled(GL_SCISSOR_TEST);
-    GLboolean last_depth = glIsEnabled(GL_DEPTH_TEST);
-    GLboolean last_blend = glIsEnabled(GL_BLEND);
-    GLboolean last_cull = glIsEnabled(GL_CULL_FACE);
+    GLState state;
+    SaveGL(state);
 
-    // 1. 모션 블러 효과 적용
-    if (motion_blur_enabled) apply_motion_blur(g_Width, g_Height);
+    if (motion_blur_enabled) {
+        apply_motion_blur(g_Width, g_Height);
+        // 모션 블러 이후 FBO 원상태로 바인딩
+        glBindFramebuffer(GL_FRAMEBUFFER, state.fbo);
+    }
 
-    // 2. ImGui 렌더링을 위한 안전한 상태 설정 (투명화/충돌 방지 핵심)
-    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
+    // ★ 가장 중요한 ImGui 렌더링을 위한 안전 조치 ★
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glBindVertexArray(0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
 
     ImGuiIO& io = ImGui::GetIO();
-    io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
+    if (g_Width > 0 && g_Height > 0) {
+        io.DisplaySize = ImVec2((float)g_Width, (float)g_Height);
+    }
+
     ImGui_ImplOpenGL3_NewFrame();
     ImGui_ImplAndroid_NewFrame(); 
     ImGui::NewFrame();
@@ -402,25 +431,11 @@ static void Render() {
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
-    // 3. 게임 원래 상태로 완벽 복구
-    glUseProgram(last_prog);
-    glActiveTexture(last_active_tex);
-    glBindTexture(GL_TEXTURE_2D, last_tex);
-    glBindVertexArray(last_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, last_array_buffer);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, last_element_array_buffer);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, last_unpack);
-    glBindFramebuffer(GL_FRAMEBUFFER, last_fbo);
-    glViewport(last_viewport[0], last_viewport[1], last_viewport[2], last_viewport[3]);
-    
-    if (last_scissor) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
-    if (last_depth) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (last_blend) glEnable(GL_BLEND); else glDisable(GL_BLEND);
-    if (last_cull) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    RestoreGL(state);
 }
 
 // ==========================================
-// [7] EGL 및 메인 훅 세팅
+// [8] EGL 및 메인 훅 세팅
 // ==========================================
 static EGLSurface hook_eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint* attrib_list) {
     if (win) g_Window = (ANativeWindow*)win;
@@ -440,12 +455,17 @@ static EGLBoolean hook_eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurfac
 static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
     if (!orig_eglSwapBuffers) return EGL_FALSE;
     EGLContext ctx = eglGetCurrentContext();
+    
     if (ctx != EGL_NO_CONTEXT && surf != EGL_NO_SURFACE) {
         eglQuerySurface(dpy, surf, EGL_WIDTH, &g_Width);
         eglQuerySurface(dpy, surf, EGL_HEIGHT, &g_Height);
         
-        if (!g_Initialized && g_Window && g_Width > 0 && g_Height > 0) Setup();
-        if (g_Initialized) Render();
+        if (!g_Initialized && g_Window && g_Width > 0 && g_Height > 0) {
+            Setup(g_Window);
+        }
+        if (g_Initialized) {
+            Render();
+        }
     }
     return orig_eglSwapBuffers(dpy, surf);
 }
@@ -459,7 +479,7 @@ static void HookInput() {
 }
 
 static void* MainThread(void*) {
-    sleep(3); // 게임 및 라이브러리 로드 대기
+    // 주의: 여기서 sleep(3)를 사용하면 eglCreateWindowSurface 타이밍을 놓쳐서 g_Window가 null이 됩니다. 지워야 합니다.
     GlossInit(true);
     
     GHandle hEGL = GlossOpen("libEGL.so");
