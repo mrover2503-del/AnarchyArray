@@ -27,9 +27,6 @@
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "AnarchyArray", __VA_ARGS__)
 
-// ==========================================
-// [1] 전역 변수 및 상태
-// ==========================================
 static bool g_Initialized = false;
 static int g_Width = 0, g_Height = 0;
 static ANativeWindow* g_Window = nullptr;
@@ -43,9 +40,6 @@ static bool g_PatchesReady = false;
 static std::vector<uintptr_t> g_PatchAddrs;
 static std::vector<std::array<uint8_t,4>> g_Originals;
 
-// ==========================================
-// [2] Motion Blur 쉐이더 및 리소스
-// ==========================================
 const char* vertexShaderSource = R"(
 attribute vec4 aPosition;
 attribute vec2 aTexCoord;
@@ -188,9 +182,6 @@ void apply_motion_blur(int width, int height) {
     pingPongIndex = prev;
 }
 
-// ==========================================
-// [3] 강력한 OpenGL 상태 백업/복구 체계
-// ==========================================
 struct GLState {
     GLint program, vao, fbo, array_buffer, element_array_buffer, unpack_buffer;
     GLint viewport[4], scissor[4];
@@ -227,9 +218,6 @@ static void RestoreGL(const GLState& s) {
     if (s.cullFace) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
 }
 
-// ==========================================
-// [4] 입력 훅 (libinput.so)
-// ==========================================
 static void (*initMotionEvent)(void*, void*, void*) = nullptr;
 static void HookInput1(void* thiz, void* a1, void* a2) {
     if (initMotionEvent) initMotionEvent(thiz, a1, a2);
@@ -243,9 +231,6 @@ static int32_t HookInput2(void* thiz, void* a1, bool a2, long a3, uint32_t* a4, 
     return result;
 }
 
-// ==========================================
-// [5] 마인크래프트 메모리 패치 로직
-// ==========================================
 static uint32_t EncodeCmpW8Imm_Table(int imm) {
     if (imm < 0 || imm > 575) return 0;
     uint32_t instr = 0x7100001F;
@@ -287,9 +272,6 @@ static void ScanSignatures() {
     g_PatchesReady = true;
 }
 
-// ==========================================
-// [6] 통합 메뉴 UI
-// ==========================================
 static void DrawMenu() {
     ImGui::SetNextWindowPos(ImVec2(10, 80), ImGuiCond_FirstUseEver);
     ImGui::Begin("AnarchyArray Menu", nullptr, ImGuiWindowFlags_AlwaysAutoResize);
@@ -298,6 +280,7 @@ static void DrawMenu() {
         static bool infinitySpread = false;
         static bool spongePlus = false;
         static bool spongePlusPlus = false;
+        static bool spongeAll = false;
         static int absorbTypeVal = 5;
 
         if (ImGui::Checkbox("InfinitySpread", &infinitySpread) && g_PatchesReady) {
@@ -323,6 +306,9 @@ static void DrawMenu() {
         }
         ImGui::EndDisabled();
 
+        ImGui::Checkbox("Sponge All", &spongeAll);
+
+        ImGui::BeginDisabled(spongeAll);
         ImGui::Text("Absorb Type:"); ImGui::SameLine();
         ImGui::SetNextItemWidth(50);
         ImGui::InputInt("##absorbDisplay", &absorbTypeVal, 0, 0, ImGuiInputTextFlags_ReadOnly); ImGui::SameLine();
@@ -333,12 +319,18 @@ static void DrawMenu() {
         if (ImGui::Button("-", ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight())) && absorbTypeVal > 0) absorbTypeVal--; ImGui::SameLine();
         if (ImGui::Button("+", ImVec2(ImGui::GetFrameHeight(), ImGui::GetFrameHeight())) && absorbTypeVal < 575) absorbTypeVal++;
         ImGui::PopStyleVar(2);
+        ImGui::EndDisabled();
 
-        if (g_PatchesReady && absorbTypeVal >= 0 && absorbTypeVal <= 575) {
+        if (g_PatchesReady) {
             for (size_t idx : {6, 7}) {
                 if (idx < g_PatchAddrs.size() && g_PatchAddrs[idx] != 0) {
-                    uint32_t instr = EncodeCmpW8Imm_Table(absorbTypeVal);
-                    if (instr != 0) WriteMemory((void*)g_PatchAddrs[idx], &instr, 4, true);
+                    if (spongeAll) {
+                        uint32_t patchAll = 0x7100003F;
+                        WriteMemory((void*)g_PatchAddrs[idx], &patchAll, 4, true);
+                    } else if (absorbTypeVal >= 0 && absorbTypeVal <= 575) {
+                        uint32_t instr = EncodeCmpW8Imm_Table(absorbTypeVal);
+                        if (instr != 0) WriteMemory((void*)g_PatchAddrs[idx], &instr, 4, true);
+                    }
                 }
             }
         }
@@ -375,9 +367,6 @@ static void DrawMenu() {
     ImGui::End();
 }
 
-// ==========================================
-// [7] ImGui 초기화 및 메인 렌더링 루프
-// ==========================================
 static void Setup(ANativeWindow* window) {
     if (g_Initialized || !window) return;
     ImGui::CreateContext();
@@ -407,11 +396,9 @@ static void Render() {
 
     if (motion_blur_enabled) {
         apply_motion_blur(g_Width, g_Height);
-        // 모션 블러 이후 FBO 원상태로 바인딩
         glBindFramebuffer(GL_FRAMEBUFFER, state.fbo);
     }
 
-    // ★ 가장 중요한 ImGui 렌더링을 위한 안전 조치 ★
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     glBindVertexArray(0);
     glDisable(GL_DEPTH_TEST);
@@ -434,9 +421,6 @@ static void Render() {
     RestoreGL(state);
 }
 
-// ==========================================
-// [8] EGL 및 메인 훅 세팅
-// ==========================================
 static EGLSurface hook_eglCreateWindowSurface(EGLDisplay dpy, EGLConfig config, EGLNativeWindowType win, const EGLint* attrib_list) {
     if (win) g_Window = (ANativeWindow*)win;
     return orig_eglCreateWindowSurface(dpy, config, win, attrib_list);
@@ -479,7 +463,6 @@ static void HookInput() {
 }
 
 static void* MainThread(void*) {
-    // 주의: 여기서 sleep(3)를 사용하면 eglCreateWindowSurface 타이밍을 놓쳐서 g_Window가 null이 됩니다. 지워야 합니다.
     GlossInit(true);
     
     GHandle hEGL = GlossOpen("libEGL.so");
